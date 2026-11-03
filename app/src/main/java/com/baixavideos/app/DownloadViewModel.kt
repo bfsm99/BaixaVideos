@@ -134,18 +134,19 @@ object Downloads {
                         addOption("-S", sortFor(s.quality))
                         addOption("--merge-output-format", "mp4")
                         addOption("--remux-video", "mp4")
-                        // HLS (vídeo em segmentos) baixado pelo FFmpeg gera timestamps corretos para avançar o vídeo
-                        addOption("--downloader", "m3u8:ffmpeg")
                         addOption("--postprocessor-args", "ffmpeg:-movflags +faststart")
                     }
                 }
+                var part = 0
                 YoutubeDL.getInstance().execute(req, PROCESS_ID) { progress, eta, line ->
+                    if (line.contains("[download] Destination:")) part++
+                    val step = postProcessingStep(line)
                     _state.update {
-                        it.copy(
-                            progress = progress / 100f,
-                            status = if (progress > 0) "Baixando… ${progress.toInt()}%  (faltam ${eta}s)" else "Processando…",
-                            log = line,
-                        )
+                        when {
+                            progress >= 0f -> it.copy(progress = progress / 100f, status = progressText(progress, eta, line, part), log = line)
+                            step != null -> it.copy(progress = -1f, status = step, log = line)
+                            else -> it.copy(log = line)
+                        }
                     }
                 }
                 _state.update { it.copy(status = "Salvando em Downloads…", progress = -1f) }
@@ -188,6 +189,37 @@ object Downloads {
                 _state.update { it.copy(busy = false, status = "Falha ao atualizar: ${shortError(e)}") }
             }
         }
+    }
+
+    // Linha típica do yt-dlp: "[download]  45.3% of ~ 120.50MiB at  2.31MiB/s ETA 00:40 (frag 12/80)"
+    private val totalRegex = Regex("""of\s+~?\s*([\d.]+)\s*([KMGT]?i?B)""")
+    private val speedRegex = Regex("""at\s+([\d.]+\s*[KMGT]?i?B/s)""")
+
+    private fun progressText(percent: Float, etaSec: Long, line: String, part: Int): String {
+        val what = if (part >= 2) "Baixando áudio" else "Baixando"
+        val parts = mutableListOf("$what… ${"%.1f".format(percent)}%")
+        totalRegex.find(line)?.let { m ->
+            val total = m.groupValues[1].toDoubleOrNull()
+            val unit = m.groupValues[2]
+            if (total != null) parts += "${"%.1f".format(total * percent / 100)} de ${"%.1f".format(total)} $unit"
+        }
+        speedRegex.find(line)?.let { parts += it.groupValues[1].replace(" ", "") }
+        if (etaSec > 0) parts += "faltam ${formatEta(etaSec)}"
+        return parts.joinToString(" · ")
+    }
+
+    private fun formatEta(sec: Long): String =
+        if (sec >= 3600) "%d:%02d:%02d".format(sec / 3600, sec % 3600 / 60, sec % 60)
+        else "%d:%02d".format(sec / 60, sec % 60)
+
+    /** Etapas depois do download, que não têm percentagem. */
+    private fun postProcessingStep(line: String): String? = when {
+        line.startsWith("[Merger]") -> "Juntando vídeo e áudio…"
+        line.startsWith("[FixupM3u8]") || line.startsWith("[Fixup") -> "Corrigindo o vídeo…"
+        line.startsWith("[VideoRemuxer]") || line.startsWith("[VideoConvertor]") -> "Convertendo para MP4…"
+        line.startsWith("[ExtractAudio]") -> "Convertendo para MP3…"
+        line.startsWith("[info]") || line.startsWith("[youtube]") -> "Preparando o download…"
+        else -> null
     }
 
     private fun sortFor(q: Quality): String = when (q) {
