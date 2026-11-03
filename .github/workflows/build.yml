@@ -46,7 +46,19 @@ jobs:
           SIGNING_PASSWORD: ${{ secrets.SIGNING_PASSWORD }}
         run: |
           export SIGNING_PASSWORD="$(printf '%s' "$SIGNING_PASSWORD" | tr -d ' \r\n\t')"
-          gradle assembleRelease --no-daemon
+          if ! keytool -list -keystore "$SIGNING_KEYSTORE_PATH" -storepass "$SIGNING_PASSWORD" > /dev/null 2>&1; then
+            echo "::error::O Secret SIGNING_PASSWORD não corresponde à chave. Cole de novo o conteúdo de keystore/SIGNING_PASSWORD.txt."
+            exit 1
+          fi
+          set +e
+          gradle assembleRelease --no-daemon 2>&1 | tee build.log
+          status=${PIPESTATUS[0]}
+          set -e
+          if [ "$status" -ne 0 ]; then
+            # Mostra as linhas do erro como anotações, visíveis sem abrir o log
+            grep -E "^e: |What went wrong|Caused by|> " build.log | head -8 | while IFS= read -r l; do echo "::error::$l"; done
+            exit 1
+          fi
           cp app/build/outputs/apk/release/app-release.apk BaixaVideos.apk
 
       - name: Publicar Release
