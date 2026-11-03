@@ -14,8 +14,8 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: 17
@@ -32,7 +32,12 @@ jobs:
             echo "::error::Faltam os Secrets SIGNING_KEY e SIGNING_PASSWORD (Settings > Secrets and variables > Actions)."
             exit 1
           fi
-          echo "$SIGNING_KEY" | base64 -d > "$RUNNER_TEMP/release.jks"
+          # Ignora espaços/quebras de linha que possam ter entrado ao colar o Secret
+          if ! printf '%s' "$SIGNING_KEY" | tr -d ' \r\n\t' | base64 -d > "$RUNNER_TEMP/release.jks"; then
+            echo "::error::O Secret SIGNING_KEY não é base64 válido. Cole de novo o conteúdo de keystore/SIGNING_KEY.txt."
+            exit 1
+          fi
+          echo "Chave de assinatura: $(stat -c %s "$RUNNER_TEMP/release.jks") bytes"
           echo "SIGNING_KEYSTORE_PATH=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
           echo "VERSION_CODE=$((GITHUB_RUN_NUMBER + 100))" >> "$GITHUB_ENV"
 
@@ -40,6 +45,7 @@ jobs:
         env:
           SIGNING_PASSWORD: ${{ secrets.SIGNING_PASSWORD }}
         run: |
+          export SIGNING_PASSWORD="$(printf '%s' "$SIGNING_PASSWORD" | tr -d ' \r\n\t')"
           gradle assembleRelease --no-daemon
           cp app/build/outputs/apk/release/app-release.apk BaixaVideos.apk
 
