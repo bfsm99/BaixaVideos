@@ -12,11 +12,16 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import java.io.File
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 
 enum class Quality(val label: String) {
     BEST("Melhor"),
@@ -119,35 +124,79 @@ object Downloads {
             tmpDir.deleteRecursively()
             tmpDir.mkdirs()
             try {
+                _state.update { it.copy(status = "Preparando o download…", progress = -1f) }
+                // Tamanho estimado do formato escolhido, para calcular o progresso quando o FFmpeg baixa
+                val estimate = try {
+                    val info = YoutubeDL.getInstance().getInfo(
+                        YoutubeDLRequest(s.url).apply {
+                            addOption("--no-playlist")
+                            addFormatOptions(s.quality)
+                        }
+                    )
+                    info.fileSize.takeIf { it > 0 } ?: info.fileSizeApproximate.takeIf { it > 0 }
+                } catch (_: Exception) {
+                    null
+                }
+
                 val req = YoutubeDLRequest(s.url).apply {
                     addOption("--no-playlist")
                     addOption("--no-mtime")
                     addOption("--restrict-filenames")
                     addOption("-o", "${tmpDir.absolutePath}/%(title).120B [%(id)s].%(ext)s")
+                    addFormatOptions(s.quality)
                     if (s.quality == Quality.AUDIO) {
                         addOption("-x")
                         addOption("--audio-format", "mp3")
                         addOption("--audio-quality", "0")
                     } else {
-                        // Prefere H.264 + AAC: o formato mais compatível com players de celular
-                        addOption("-f", "bv*+ba/b")
-                        addOption("-S", sortFor(s.quality))
                         addOption("--merge-output-format", "mp4")
                         addOption("--remux-video", "mp4")
+                        // HLS (vídeo em segmentos) baixado pelo FFmpeg: timestamps corretos, sem artefactos ao avançar
+                        addOption("--downloader", "m3u8:ffmpeg")
                         addOption("--postprocessor-args", "ffmpeg:-movflags +faststart")
                     }
                 }
-                var part = 0
-                YoutubeDL.getInstance().execute(req, PROCESS_ID) { progress, eta, line ->
-                    if (line.contains("[download] Destination:")) part++
-                    val step = postProcessingStep(line)
-                    _state.update {
-                        when {
-                            progress >= 0f -> it.copy(progress = progress / 100f, status = progressText(progress, eta, line, part), log = line)
-                            step != null -> it.copy(progress = -1f, status = step, log = line)
-                            else -> it.copy(log = line)
+
+                // Partilhados entre a thread do yt-dlp e o monitor
+                val part = AtomicInteger(0)
+                val lastNativeProgress = AtomicLong(0L)
+                val postProcessing = AtomicBoolean(false)
+
+                // O FFmpeg não reporta progresso: mede o tamanho dos ficheiros em tmpDir
+                val monitor = launch {
+                    var lastBytes = 0L
+                    var lastTime = System.currentTimeMillis()
+                    var speed = 0.0
+                    while (isActive) {
+                        delay(1000)
+                        val now = System.currentTimeMillis()
+                        val bytes = tmpDir.walkTopDown().filter { it.isFile }.sumOf { it.length() }
+                        val instant = (bytes - lastBytes).coerceAtLeast(0) * 1000.0 / (now - lastTime).coerceAtLeast(1)
+                        speed = if (speed == 0.0) instant else speed * 0.7 + instant * 0.3
+                        lastBytes = bytes
+                        lastTime = now
+                        if (bytes == 0L || postProcessing.get() || now - lastNativeProgress.get() < 3000) continue
+                        _state.update { it.copy(progress = estimateProgress(bytes, estimate), status = sizeProgressText(bytes, estimate, speed, part.get())) }
+                    }
+                }
+                try {
+                    YoutubeDL.getInstance().execute(req, PROCESS_ID) { progress, eta, line ->
+                        if (line.contains("[download] Destination:")) part.incrementAndGet()
+                        val step = postProcessingStep(line)
+                        if (step != null && !line.startsWith("[info]") && !line.startsWith("[youtube]")) postProcessing.set(true)
+                        if (progress >= 0f) lastNativeProgress.set(System.currentTimeMillis())
+                        _state.update {
+                            when {
+                                progress >= 0f -> {
+                                    it.copy(progress = progress / 100f, status = progressText(progress, eta, line, part.get()), log = line)
+                                }
+                                step != null -> it.copy(progress = -1f, status = step, log = line)
+                                else -> it.copy(log = line)
+                            }
                         }
                     }
+                } finally {
+                    monitor.cancel()
                 }
                 _state.update { it.copy(status = "Salvando em Downloads…", progress = -1f) }
                 val saved = tmpDir.listFiles().orEmpty()
@@ -206,6 +255,40 @@ object Downloads {
         speedRegex.find(line)?.let { parts += it.groupValues[1].replace(" ", "") }
         if (etaSec > 0) parts += "faltam ${formatEta(etaSec)}"
         return parts.joinToString(" · ")
+    }
+
+    /** Progresso calculado pelo tamanho já escrito em disco (downloads feitos pelo FFmpeg). */
+    private fun sizeProgressText(bytes: Long, estimate: Long?, speed: Double, part: Int): String {
+        val what = if (part >= 2) "Baixando áudio" else "Baixando"
+        val parts = mutableListOf<String>()
+        if (estimate != null && estimate > 0) {
+            parts += "$what… ${"%.1f".format(estimateProgress(bytes, estimate) * 100)}%"
+            parts += "${formatBytes(bytes)} de ~${formatBytes(estimate)}"
+        } else {
+            parts += "$what… ${formatBytes(bytes)}"
+        }
+        if (speed > 0) parts += "${formatBytes(speed.toLong())}/s"
+        if (estimate != null && speed > 0 && estimate > bytes) parts += "faltam ${formatEta(((estimate - bytes) / speed).toLong())}"
+        return parts.joinToString(" · ")
+    }
+
+    private fun estimateProgress(bytes: Long, estimate: Long?): Float =
+        if (estimate == null || estimate <= 0) -1f else (bytes.toFloat() / estimate).coerceIn(0f, 0.99f)
+
+    private fun formatBytes(b: Long): String = when {
+        b >= 1L shl 30 -> "%.2f GB".format(b / (1L shl 30).toDouble())
+        b >= 1L shl 20 -> "%.1f MB".format(b / (1L shl 20).toDouble())
+        else -> "%.0f KB".format(b / 1024.0)
+    }
+
+    private fun YoutubeDLRequest.addFormatOptions(q: Quality) {
+        if (q == Quality.AUDIO) {
+            addOption("-f", "ba/b")
+        } else {
+            // Prefere H.264 + AAC: o formato mais compatível com players de celular
+            addOption("-f", "bv*+ba/b")
+            addOption("-S", sortFor(q))
+        }
     }
 
     private fun formatEta(sec: Long): String =
