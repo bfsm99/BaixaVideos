@@ -169,6 +169,13 @@ fun MainScreen(vm: DownloadViewModel) {
                 )
             }
         }
+        if (s.quality == Quality.GIF && !s.directGif) {
+            Text(
+                "Converte o vídeo num GIF sem som. Ideal para vídeos curtos: um GIF de 1 minuto pode passar dos 50 MB.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
 
         if (s.busy) {
             Button(

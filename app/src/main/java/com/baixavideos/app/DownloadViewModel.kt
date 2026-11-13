@@ -18,7 +18,10 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import android.net.Uri
 import java.io.File
+import java.net.HttpURLConnection
+import java.net.URL
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
@@ -29,6 +32,7 @@ enum class Quality(val label: String) {
     P720("720p"),
     P480("480p"),
     AUDIO("Só áudio (MP3)"),
+    GIF("GIF animado"),
 }
 
 data class VideoPreview(
@@ -45,6 +49,8 @@ data class UiState(
     val url: String = "",
     val quality: Quality = Quality.BEST,
     val preview: VideoPreview? = null,
+    /** Link direto para um ficheiro .gif (o yt-dlp não baixa imagens). */
+    val directGif: Boolean = false,
     val progress: Float = -1f,
     val status: String = "Preparando o motor de download…",
     val log: String = "",
@@ -80,7 +86,7 @@ object Downloads {
         }
     }
 
-    fun setUrl(url: String) = _state.update { it.copy(url = url.trim(), preview = null) }
+    fun setUrl(url: String) = _state.update { it.copy(url = url.trim(), preview = null, directGif = false) }
     fun setQuality(q: Quality) = _state.update { it.copy(quality = q) }
 
     fun analyze() {
@@ -88,6 +94,10 @@ object Downloads {
         if (url.isBlank() || !_state.value.ready || _state.value.busy) return
         job = scope.launch {
             _state.update { it.copy(busy = true, progress = -1f, status = "Buscando informações…", preview = null) }
+            if (looksLikeGif(url) || isGifByContentType(url)) {
+                _state.update { it.copy(busy = false, directGif = true, preview = gifPreview(url), status = "GIF encontrado. Toque em Baixar.") }
+                return@launch
+            }
             try {
                 val req = YoutubeDLRequest(url).apply { addOption("--no-playlist") }
                 val info = YoutubeDL.getInstance().getInfo(req)
@@ -124,6 +134,13 @@ object Downloads {
             tmpDir.deleteRecursively()
             tmpDir.mkdirs()
             try {
+                if (s.directGif || looksLikeGif(s.url)) {
+                    val file = downloadDirect(s.url, tmpDir)
+                    _state.update { it.copy(status = "Salvando em Downloads…", progress = -1f) }
+                    val saved = MediaSaver.saveToDownloads(context, file)
+                    _state.update { it.copy(busy = false, progress = 1f, status = "Concluído! Salvo em $saved") }
+                    return@launch
+                }
                 _state.update { it.copy(status = "Preparando o download…", progress = -1f) }
                 // Tamanho estimado do formato escolhido, para calcular o progresso quando o FFmpeg baixa
                 val estimate = try {
@@ -148,6 +165,13 @@ object Downloads {
                         addOption("-x")
                         addOption("--audio-format", "mp3")
                         addOption("--audio-quality", "0")
+                    } else if (s.quality == Quality.GIF) {
+                        // Converte o vídeo em GIF: 12 fps, 480 px de largura e paleta própria para boas cores
+                        addOption("--recode-video", "gif")
+                        addOption(
+                            "--postprocessor-args",
+                            "VideoConvertor:-an -sn -vf fps=12,scale=480:-2:flags=lanczos,split[a][b];[a]palettegen[p];[b][p]paletteuse -loop 0",
+                        )
                     } else {
                         addOption("--merge-output-format", "mp4")
                         addOption("--remux-video", "mp4")
@@ -284,12 +308,79 @@ object Downloads {
     private fun YoutubeDLRequest.addFormatOptions(q: Quality) {
         if (q == Quality.AUDIO) {
             addOption("-f", "ba/b")
+        } else if (q == Quality.GIF) {
+            // Só o vídeo, em baixa resolução: o GIF final tem 480 px
+            addOption("-f", "bv*/b")
+            addOption("-S", "res:480")
         } else {
             // Prefere H.264 + AAC: o formato mais compatível com players de celular
             addOption("-f", "bv*+ba/b")
             addOption("-S", sortFor(q))
         }
     }
+
+    private fun looksLikeGif(url: String): Boolean =
+        Uri.parse(url).path?.lowercase()?.endsWith(".gif") == true
+
+    /** Para links sem ".gif" no nome: pergunta ao servidor que tipo de ficheiro é. */
+    private fun isGifByContentType(url: String): Boolean = try {
+        val conn = openConnection(url).apply { requestMethod = "HEAD" }
+        conn.contentType?.startsWith("image/gif") == true
+    } catch (_: Exception) {
+        false
+    }
+
+    private fun gifPreview(url: String) = VideoPreview(
+        title = gifFileName(url),
+        thumbnail = url,
+        uploader = null,
+        site = "GIF",
+        durationSec = 0,
+    )
+
+    private fun gifFileName(url: String): String {
+        val name = Uri.parse(url).lastPathSegment?.substringBeforeLast('.')
+            ?.replace(Regex("[^A-Za-z0-9._-]"), "_")?.take(100)
+        return "${if (name.isNullOrBlank()) "gif_${System.currentTimeMillis()}" else name}.gif"
+    }
+
+    /** Baixa um ficheiro .gif diretamente, com progresso. */
+    private fun downloadDirect(url: String, dir: File): File {
+        val file = File(dir, gifFileName(url))
+        val conn = openConnection(url)
+        val total = conn.contentLengthLong.takeIf { it > 0 }
+        val start = System.currentTimeMillis()
+        conn.inputStream.use { input ->
+            file.outputStream().use { out ->
+                val buf = ByteArray(64 * 1024)
+                var done = 0L
+                var lastUpdate = 0L
+                while (true) {
+                    if (!_state.value.busy) throw YoutubeDL.CanceledException()
+                    val n = input.read(buf)
+                    if (n < 0) break
+                    out.write(buf, 0, n)
+                    done += n
+                    val now = System.currentTimeMillis()
+                    if (now - lastUpdate > 300) {
+                        lastUpdate = now
+                        val speed = done * 1000.0 / (now - start).coerceAtLeast(1)
+                        _state.update { it.copy(progress = estimateProgress(done, total), status = sizeProgressText(done, total, speed, 1)) }
+                    }
+                }
+            }
+        }
+        return file
+    }
+
+    private fun openConnection(url: String): HttpURLConnection =
+        (URL(url).openConnection() as HttpURLConnection).apply {
+            connectTimeout = 15_000
+            readTimeout = 30_000
+            instanceFollowRedirects = true
+            // Alguns sites recusam pedidos sem User-Agent de navegador
+            setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/124.0 Mobile Safari/537.36")
+        }
 
     private fun formatEta(sec: Long): String =
         if (sec >= 3600) "%d:%02d:%02d".format(sec / 3600, sec % 3600 / 60, sec % 60)
@@ -299,7 +390,8 @@ object Downloads {
     private fun postProcessingStep(line: String): String? = when {
         line.startsWith("[Merger]") -> "Juntando vídeo e áudio…"
         line.startsWith("[FixupM3u8]") || line.startsWith("[Fixup") -> "Corrigindo o vídeo…"
-        line.startsWith("[VideoRemuxer]") || line.startsWith("[VideoConvertor]") -> "Convertendo para MP4…"
+        line.startsWith("[VideoRemuxer]") -> "Convertendo para MP4…"
+        line.startsWith("[VideoConvertor]") -> "Criando o GIF… (pode demorar)"
         line.startsWith("[ExtractAudio]") -> "Convertendo para MP3…"
         line.startsWith("[info]") || line.startsWith("[youtube]") -> "Preparando o download…"
         else -> null
